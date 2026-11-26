@@ -1,0 +1,88 @@
+name: Sync Directory Opus Latest Release
+
+on:
+  schedule:
+    # Chạy 1 lần mỗi ngày lúc 02:00 UTC (09:00 sáng giờ VN)
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Cho phép bấm chạy tay bất cứ lúc nào
+
+permissions:
+  contents: write # Bắt buộc để tạo Release và upload file
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check latest version from GPSoftware
+        id: check
+        run: |
+          # Lấy URL redirect thực tế từ trang download/release của GPSoftware
+          FINAL_URL=$(curl -Ls -o /dev/null -w %{url_effective} "https://www.gpsoft.com.au/download/release")
+          echo "Download URL: $FINAL_URL"
+
+          # Trích xuất tên file gốc (vd: DOpusInstall-13.10.exe)
+          ORIG_FILENAME=$(basename "$FINAL_URL")
+          
+          # Tách chuỗi version từ tên file (hoặc dùng timestamp nếu tên file không chứa số)
+          VERSION=$(echo "$ORIG_FILENAME" | grep -oE '[0-9]+(\.[0-9]+)+' | head -n 1)
+          if [ -z "$VERSION" ]; then
+            VERSION=$(date +%Y.%m.%d)
+          fi
+
+          TAG="v${VERSION}"
+          echo "Detected Version: $VERSION (Tag: $TAG)"
+
+          echo "url=$FINAL_URL" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "orig_name=$ORIG_FILENAME" >> $GITHUB_OUTPUT
+
+      - name: Check if Release already exists
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.check.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${{ steps.check.outputs.tag }} already exists. Skipping."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download & Prepare Assets
+        if: steps.exists.outputs.skip == 'false'
+        run: |
+          mkdir -p dist
+          # Tải về và lưu thành tên cố định DOpusInstall.exe
+          curl -fL "${{ steps.check.outputs.url }}" -o "dist/DOpusInstall.exe"
+          
+          # Tạo thêm file version.txt & sha256 để script khác check nhanh mà không cần tải file exe
+          echo "${{ steps.check.outputs.version }}" > dist/version.txt
+          sha256sum dist/DOpusInstall.exe | awk '{print $1}' > dist/DOpusInstall.exe.sha256
+
+      - name: Publish GitHub Release
+        if: steps.exists.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.check.outputs.tag }}" \
+            dist/DOpusInstall.exe \
+            dist/version.txt \
+            dist/DOpusInstall.exe.sha256 \
+            --repo "${{ github.repository }}" \
+            --title "Directory Opus ${{ steps.check.outputs.version }}" \
+            --notes "Original file: \`${{ steps.check.outputs.orig_name }}\` | Source: ${{ steps.check.outputs.url }}" \
+            --latest
+
+      - name: Cleanup old releases (Keep last 3)
+        if: steps.exists.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Xóa các bản release cũ hơn 3 bản gần nhất để giữ repo gọn gàng
+          gh release list --repo "${{ github.repository }}" --limit 100 --json tagName -q '.[3:][].tagName' | while read -r old_tag; do
+            if [ -n "$old_tag" ]; then
+              echo "Deleting old release: $old_tag"
+              gh release delete "$old_tag" --repo "${{ github.repository }}" --yes --cleanup-tag
+            fi
+          done
